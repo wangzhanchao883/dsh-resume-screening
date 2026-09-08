@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+config.json
+classify-cache.json
+test-data/
+videos/
+
+.selftest/
+*.db
+design-*.md

@@ -1,0 +1,5 @@
+# dsh-resume-screening bundle patch layer.
+# 安装本包到 profile 后,host 端加载主入口(摄入/转换/抽取/筛选/存储引擎)。
+- insert:
+    - id: dsh-resume-screening
+      name: dsh-resume-screening

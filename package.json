@@ -1,0 +1,76 @@
+{
+  "name": "dsh-resume-screening",
+  "version": "0.1.0",
+  "description": "Resume screening plugin for DeepSeek Harness (HR): ingest up to 100k Word/PDF/Excel resumes into one searchable library with skills / coarse categories / ingest time, auto-ingest & de-dupe new resumes, then screen by plain-language criteria — rule pre-filter in the DB plus LLM fine-judge on the shortlisted few, CSV export. 简历筛选插件:批量收简历建档(技能/粗分类/入库时间),大白话下指令,库内规则粗筛+LLM精判少数入围者,自动入库去重、可导出、可追溯。",
+  "type": "module",
+  "main": "index.mjs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wangzhanchao883/dsh-resume-screening.git"
+  },
+  "homepage": "https://github.com/wangzhanchao883/dsh-resume-screening",
+  "bugs": {
+    "url": "https://github.com/wangzhanchao883/dsh-resume-screening/issues"
+  },
+  "author": "wangzhanchao883",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "client.js",
+    "config.mjs",
+    "db.mjs",
+    "extract.mjs",
+    "scoring.mjs",
+    "convert.mjs",
+    "judge.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "check": "node --check index.mjs && node --check config.mjs && node --check db.mjs && node --check scoring.mjs && node --check convert.mjs && node --check extract.mjs && node --check judge.mjs && node --check client.js"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "mammoth": "^1.8.0",
+    "pdfjs-dist": "^4.6.82",
+    "xlsx": "^0.18.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0"
+  },
+  "engines": {
+    "node": "^22.0.0 || >=24"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "plugin",
+    "resume",
+    "resume-screening",
+    "hr",
+    "recruiting",
+    "ats",
+    "candidate",
+    "sqlite",
+    "markdown"
+  ],
+  "license": "MIT"
+}

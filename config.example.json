@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "libraryRoot": "D:\\简历库",
+  "archiveFolder": "archive",
+  "keepOriginal": true,
+  "dbFile": "resume.db",
+  "llmConfidenceThreshold": 0.6,
+  "llmFallback": true,
+  "batchSize": 50,
+  "llmTopN": 20,
+  "tags": [
+    { "key": "education", "label": "学历", "type": "enum" },
+    { "key": "gender", "label": "性别", "type": "enum" },
+    { "key": "age", "label": "年龄", "type": "number" },
+    { "key": "experience_years", "label": "工作经验", "type": "number" },
+    { "key": "school", "label": "学校", "type": "text" },
+    { "key": "major", "label": "专业", "type": "text" },
+    { "key": "project_management", "label": "项目管理经验", "type": "text" },
+    { "key": "skill", "label": "技能", "type": "text", "multi": true },
+    { "key": "skill_category", "label": "技能类别", "type": "text", "multi": true },
+    { "key": "experience_direction", "label": "经验方向", "type": "text", "multi": true }
+  ]
+}
