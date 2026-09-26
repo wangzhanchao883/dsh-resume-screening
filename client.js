@@ -2,7 +2,9 @@
  * 经典脚本形式注册到 window.__ModuleLoader__;工厂内用 require 取 React,
  * 不能用 JSX(无构建步骤),一律 React.createElement。
  * 与 dsh-study-notebook 的 client.js 同款模式。
- * 面板目标:让用户一眼看懂怎么用 —— 通用配置 + 标签库 + 岗位要求(必选/最好有 + 权重 + 说明文案)。 */
+ * 面板目标:让用户一眼看懂怎么用 —— 通用配置 + 标签库 + 岗位要求(必选/最好有 + 权重 + 说明文案)。
+ * DSH 0.1.7 契约:设置读写走 ctx.configForms.get(条目 id) —— 旧的 ctx.settingsScope 服务已被整个移除;
+ * 快照结构与旧版一致({status,value,base,user,revision,writable,mode}),故组件体无需改动。 */
 window.__ModuleLoader__.load({
   id: "dsh-resume-screening",
   factory: (require) => {
@@ -29,6 +31,10 @@ window.__ModuleLoader__.load({
       archiveFolder: "归档子目录",
       keepOriginal: "保留原始文件",
       dbFile: "数据库文件名",
+      llmThreshold: "LLM 兜底置信度阈值",
+      llmFallback: "启用 LLM 兜底抽取",
+      llmTopN: "LLM 精判数量(0=全部精判)",
+      batchSize: "批次大小",
       tags: "标签库",
       tagsHint: "标签是筛选的基本单位,每个标签带类型(enum枚举/number数值/text文本)。必选条件必须从标签库里选。",
       addTag: "添加标签",
@@ -55,6 +61,10 @@ window.__ModuleLoader__.load({
       archiveFolder: "Archive folder",
       keepOriginal: "Keep original files",
       dbFile: "DB filename",
+      llmThreshold: "LLM fallback confidence threshold",
+      llmFallback: "Enable LLM fallback extraction",
+      llmTopN: "LLM judge count (0 = judge all)",
+      batchSize: "Batch size",
       tags: "Tag library",
       tagsHint: "Tags are the screening unit; each has a type (enum/number/text). Must-conditions pick from the tag library.",
       addTag: "Add tag",
@@ -218,13 +228,25 @@ window.__ModuleLoader__.load({
             }),
             h("label", { htmlFor: "rsc-keep" }, t("keepOriginal")),
           ]),
+          h("div", { className: "rsc-switch" }, [
+            h("input", {
+              type: "checkbox", id: "rsc-llm-fallback",
+              checked: !!v.llmFallback,
+              onChange: (e) => save("llmFallback", e.target.checked),
+            }),
+            h("label", { htmlFor: "rsc-llm-fallback" }, t("llmFallback")),
+          ]),
           h("div", { className: "rsc-row" }, [
             Field({
-              label: t("itemWeight") + "·LLM阈值",
+              label: t("llmThreshold"),
               children: h(NumInput, { value: v.llmConfidenceThreshold, min: 0, max: 1, step: 0.1, onCommit: (n) => save("llmConfidenceThreshold", n) }),
             }),
             Field({
-              label: "批次大小",
+              label: t("llmTopN"),
+              children: h(NumInput, { value: v.llmTopN, min: 0, max: 10000, onCommit: (n) => save("llmTopN", n) }),
+            }),
+            Field({
+              label: t("batchSize"),
               children: h(NumInput, { value: v.batchSize, min: 1, max: 1000, onCommit: (n) => save("batchSize", n) }),
             }),
           ]),
@@ -286,7 +308,10 @@ window.__ModuleLoader__.load({
       }, "dsh-resume-screening: dictionaries");
 
       const t = ctx.locale.bind(NS);
-      const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE });
+      // 0.1.7:ctx.settingsScope 已被整个移除 → 改为向 configForms 取该 profile 条目的表单。
+      // 入参是「条目 id」(= cordis.patch.yml 里的 id),不是 locale 命名空间;返回对象的
+      // getSnapshot()/subscribe()/set(field,value)/mutate() 与旧的 scope 同名同义。
+      const scope = ctx.configForms.get(SETTINGS_NAMESPACE);
       const injected = () => ({ scope });
 
       ctx.slots.inject("settings.section", () => ctx.slots.register({
@@ -301,7 +326,7 @@ window.__ModuleLoader__.load({
 
     module.exports = {
       name: "dsh-resume-screening",
-      inject: ["slots", "locale", "settingsScope"],
+      inject: ["slots", "locale", "configForms"],
       apply,
     };
     return module.exports;

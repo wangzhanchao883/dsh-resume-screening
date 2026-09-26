@@ -9,3 +9,6 @@ videos/
 .selftest/
 *.db
 design-*.md
+# 本机 npm 走 npmmirror 镜像,lock 里 65 条 resolved 全指向镜像源;
+# 提交到公开仓库会把镜像固化进去,故不入库(0.1.0 起就没提交过)。
+package-lock.json

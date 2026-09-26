@@ -1,11 +1,13 @@
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import z from "@deepseek-ai/schemastery";
+import { isVolatile } from "@deepseek-ai/cosmokit";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, copyFileSync } from "node:fs";
-import { join, basename, dirname } from "node:path";
+import { join, basename, dirname, resolve } from "node:path";
 import { DEFAULT_CONFIG, resolveConfig, withCoarseTags } from "./config.mjs";
 import { openDb, ensureTags, upsertCandidate, updateCandidateProfile, setCandidateTags, setStatus, findCandidateByHash, candidateTagMap, addRequirement, listRequirements, getScreeningResults, listCandidates, statusCounts, resetIndex, saveScreeningLlm, getScreeningLlm, getCandidateBody } from "./db.mjs";
 import { convertFile, extOf } from "./convert.mjs";
 import { ruleExtract, needsLlmFallback, normalizeLlmProfile } from "./extract.mjs";
+import { splitArchiveMd, extractResumeBody, looksLikeArchiveMd, isNestedArchiveMd, isInsideDir } from "./md.mjs";
 import { screenAll } from "./scoring.mjs";
 import { buildJobDesc, buildJudgePrompt, normalizeJudge } from "./judge.mjs";
 
@@ -14,25 +16,65 @@ export const inject = ["tools", "commands", "settings", "llm"];
 
 const SETTINGS_NS = "dsh-resume-screening";
 
-/** 扁平 schema:settings 客户端 set(field,value) 只支持单段路径,拍平后 host 映射回嵌套 */
-const settingsSchema = z.object({
-  enabled: z.boolean().default(true),
-  libraryRoot: z.string().default(DEFAULT_CONFIG.libraryRoot),
-  archiveFolder: z.string().default(DEFAULT_CONFIG.archiveFolder),
-  keepOriginal: z.boolean().default(true),
-  dbFile: z.string().default(DEFAULT_CONFIG.dbFile),
-  tags: z.array(z.object({
+/**
+ * schemastery < 3.18.4 没有 `.volatile()`(3.18.2 上调用会抛 `volatile is not a function`,模块加载期就崩)
+ * → 降级为原 schema,保证老 DSH 上照常加载。DSH 0.1.7 自带 3.18.4,走的是带标记的分支。
+ */
+const vol = (schema) => (typeof schema.volatile === "function" ? schema.volatile() : schema);
+
+/**
+ * ⚠️ 0.1.7 最大的坑(2026-09-26 实测):标了 `.volatile()` 的字段,经 schema 解析后**不是纯值**,
+ * 而是 cosmokit 的 **Volatile 盒**(冻结对象,只有 `get()`);不 `.get()` 解包就当字符串用,
+ * `path.join()` 会抛 `The "path" argument must be of type string ... Received an instance of Object`,
+ * 表现成「插件装上后所有工具一调就崩」。
+ * 宿主自己的插件也这么解包(如 dsh-agent-default-model 的 `this.config.provider.get()`)。
+ * `isVolatile` 内部走共享 Symbol,跨 ESM/CJS 副本也认。
+ */
+const unwrap = (value) => (isVolatile(value) ? value.get() : value);
+
+/** 把一份解析后的配置(顶层字段可能是 Volatile 盒)摊平成纯值 */
+const plainConfig = (config) =>
+  Object.fromEntries(
+    Object.entries(config && typeof config === "object" ? config : {}).map(([key, value]) => [key, unwrap(value)]),
+  );
+
+/**
+ * DSH 0.1.7 起设置面板由本插件的 `Config` 投影(不再由 settings.register 托管值):
+ *  - 必须**具名导出**(模块里不能有 `export default`,否则 loader 剥壳后读不到 `.Config`)
+ *  - 每个可写字段要标 `.volatile()`(=「能现场改、改完即时生效」);**一个都没标 → 整个条目被静默过滤**,面板消失且不报错
+ *  - 结构保持扁平:客户端便捷方法 `configForms.set(field, value)` 一次只写一个一级键
+ * 字段定义逐字沿用旧 settingsSchema,只是逐项盖章 —— 迁移零行为变化。
+ */
+const CONFIG_FIELDS = {
+  enabled: vol(z.boolean().default(true)),
+  libraryRoot: vol(z.string().default(DEFAULT_CONFIG.libraryRoot)),
+  archiveFolder: vol(z.string().default(DEFAULT_CONFIG.archiveFolder)),
+  keepOriginal: vol(z.boolean().default(true)),
+  dbFile: vol(z.string().default(DEFAULT_CONFIG.dbFile)),
+  // tags 也必须盖章:面板的「标签库」走 scope.set("tags", …),而 host 的 write() 会用
+  // isVolatilePath 逐段校验(只看 dict,不认 array 的 inner) —— 不盖章就直接抛
+  // `Config field "tags" is not volatile`,标签库变成只读。盖章后才写得进去。
+  // ⚠️ default 必须是**完整默认标签库**,不能是 []。
+  // 设置行通常只有 `disabled: false`(没写过 tags),此时 schema 默认值就是最终值;
+  // 若默认写成 [],resolveConfig 会用它**整体冲掉** DEFAULT_CONFIG.tags
+  // (数组在 mergeDeep 里是整体替换,不合并),于是标签字典只剩 withCoarseTags 兜的那 2 个粗分类维度
+  // → skill/education/gender/age 这些键在 tags 表里根本不存在 → 所有按标签的筛选静默返回 0 人。
+  // 实测:默认 [] 时新库只有「标签共 2 个」。
+  tags: vol(z.array(z.object({
     key: z.string(),
     label: z.string(),
     type: z.union([z.const("enum"), z.const("number"), z.const("boolean"), z.const("text")]),
     description: z.string().default(""),
     multi: z.boolean().default(false),
-  })).default([]),
-  llmConfidenceThreshold: z.number().min(0).max(1).default(DEFAULT_CONFIG.llmConfidenceThreshold),
-  llmFallback: z.boolean().default(true),
-  batchSize: z.number().min(1).max(1000).default(DEFAULT_CONFIG.batchSize),
-  llmTopN: z.number().min(0).max(10000).default(DEFAULT_CONFIG.llmTopN),
-});
+  })).default(DEFAULT_CONFIG.tags.map((t) => ({ ...t })))),
+  llmConfidenceThreshold: vol(z.number().min(0).max(1).default(DEFAULT_CONFIG.llmConfidenceThreshold)),
+  llmFallback: vol(z.boolean().default(true)),
+  batchSize: vol(z.number().min(1).max(1000).default(DEFAULT_CONFIG.batchSize)),
+  llmTopN: vol(z.number().min(0).max(10000).default(DEFAULT_CONFIG.llmTopN)),
+};
+
+/** 设置面板的字段声明(DSH 0.1.7 读它来投影表单) */
+export const Config = z.object(CONFIG_FIELDS);
 
 /** 归档目录(纯函数) */
 function archiveDir(config) {
@@ -42,21 +84,45 @@ function archiveDir(config) {
 /** 当前插件级配置(host 每次读取最新) */
 let liveConfig = null;
 
+/**
+ * 0.1.7 起 `settings.register(ns, schema, {base})` / `scope.get()` / `scope.watch()` 全部作废:
+ * 设置服务不再替插件保管值,只把插件的 `Config` **投影**成表单。权威值在 profile 配置里。
+ *  - 读:`settings.describe()` 找 ns === SETTINGS_NS 的条目(返回 { ns, value })
+ *  - 写:由 DSH 侧落盘;**实测写入不会让本插件重新 apply**(见 currentConfig 注释),
+ *    所以每个入口都要靠 describe() 重读,不能只依赖 apply 时刻的快照。
+ * `describe` 在旧版 DSH 上不存在 → 探测后安全降级,退回 apply 的入参。
+ */
+let settingsService = null;
+/** 模块级 logger:syncFromSettings 是模块级函数,取不到 apply 的 ctx */
+let logger = null;
+
+function syncFromSettings() {
+  if (!settingsService || typeof settingsService.describe !== "function") return false;
+  try {
+    const row = settingsService.describe().find((it) => it && it.ns === SETTINGS_NS);
+    if (!row || row.value === undefined || row.value === null) return false;
+    // describe() 给的同样是「带 Volatile 盒」的解析值 → 先解包再合并
+    const patch = plainConfig(row.value);
+    // 只覆盖有值的键:避免 undefined 把 resolveConfig 兜好的默认值冲掉
+    for (const key of Object.keys(patch)) if (patch[key] === undefined) delete patch[key];
+    liveConfig = { ...liveConfig, ...patch };
+    return true;
+  } catch (err) {
+    try {
+      logger?.warn(`dsh-resume-screening: 读取设置失败(继续用已有配置):${err && err.message ? err.message : err}`);
+    } catch {}
+    return false;
+  }
+}
+
 export function apply(ctx, input = {}) {
-  liveConfig = resolveConfig(input);
+  logger = ctx.logger;
+  // 0.1.7:入参是经 `Config` 解析后的配置,volatile 字段是盒 → 必须解包
+  liveConfig = resolveConfig(plainConfig(input));
 
   ctx.inject(["settings"], (settingsCtx) => {
-    try {
-      const scope = settingsCtx.settings.register(SETTINGS_NS, settingsSchema, { base: toFlat(liveConfig) });
-      const resolved = scope.get();
-      if (resolved) liveConfig = { ...liveConfig, ...fromFlat(resolved) };
-      scope.watch((next) => {
-        if (!next) return;
-        liveConfig = { ...liveConfig, ...fromFlat(next) };
-      });
-    } catch (err) {
-      ctx.logger.warn(`dsh-resume-screening: 设置命名空间注册失败:${err.message}`);
-    }
+    settingsService = settingsCtx.settings;
+    syncFromSettings();
   });
 
   // ---------- 工具:建库/初始化 ----------
@@ -87,7 +153,7 @@ export function apply(ctx, input = {}) {
       if (!existsSync(fp)) return `路径不存在:${fp}`;
       const db = openDb(cfg);
       ensureTags(db, cfg.tags || []);
-      const files = collectResumeFiles(fp);
+      const files = collectResumeFiles(fp, [archiveDir(cfg)]);
       let added = 0, dup = 0, skipped = 0;
       for (const f of files) {
         const hash = await contentHash(f);
@@ -270,12 +336,25 @@ export function apply(ctx, input = {}) {
       const tagIds = ensureTags(db, cfg.tags || []);
       const arch = archiveDir(cfg);
       let rebuilt = 0;
+      let dropped = 0;
       if (existsSync(arch)) {
         const files = collectMd(arch);
+        // 先解析并按 raw_hash 归并:历史 bug 留下过"嵌套归档"文件(正文里又套着一份归档 MD),
+        // 同一份简历会同时存在 -4.md 和 -21.md。
+        // 择优顺序:**标签更全的优先**(标签数是抽取质量的直接体现;老文件里常见 `skill: 技能`
+        // 这种关键词表 bug 留下的垃圾值)、其次非嵌套、最后文件序号大的(更新)。
+        // 只按"非嵌套"选会选错:实测真实库里干净的那份反而是技能抽坏的老文件。
+        const picked = new Map();
         for (const f of files) {
           const parsed = parseResumeMd(f);
           if (!parsed) continue;
           const hash = parsed.meta.raw_hash || await contentHash(f);
+          const cur = picked.get(hash);
+          if (!cur) { picked.set(hash, { f, parsed, hash }); continue; }
+          dropped += 1;
+          if (isBetterArchiveCopy(parsed, f, cur.parsed, cur.f)) picked.set(hash, { f, parsed, hash });
+        }
+        for (const { f, parsed, hash } of picked.values()) {
           const id = upsertCandidate(db, { name: parsed.meta.name || basename(f), mdPath: f, rawHash: hash, status: "archived" });
           if (parsed.profile) updateCandidateProfile(db, id, parsed.profile);
           if (parsed.tags?.length) setCandidateTags(db, id, tagIds, parsed.tags);
@@ -283,7 +362,7 @@ export function apply(ctx, input = {}) {
         }
       }
       db.close();
-      return `已从归档重建 ${rebuilt} 份候选人索引`;
+      return `已从归档重建 ${rebuilt} 份候选人索引${dropped ? `(跳过 ${dropped} 个重复/嵌套副本)` : ""}`;
     },
   }));
 
@@ -345,27 +424,47 @@ export function apply(ctx, input = {}) {
 async function processOne(ctx, db, cfg, candidate, tagIds, forceLlm, route) {
   try {
     setStatus(db, candidate.id, "converting");
-    // 真相来源 = source_path(原始文件);老数据回退到 md_path
-    const sourceAbs = candidate.source_path || candidate.md_path;
-    let mdText = "";
-    if (!sourceAbs || !existsSync(sourceAbs)) {
+    const arch = archiveDir(cfg);
+    // 真相来源 = source_path(原始文件)。
+    // 但历史数据里有 source_path 为空、只剩 md_path 的记录,而 md_path 是**我们自己的归档产物**:
+    // 把它当原始简历再吃一遍,就会把整份归档 MD(含 frontmatter / ## 标签 / ## 简历原文)嵌进新 MD,
+    // 形成 -4.md → -21.md 的嵌套,并让规则抽取读到上一层 frontmatter 的残留(如 major: ---)。
+    // 所以这里分两条路:能拿到真原始文件才"转换 + 归档";只有归档 MD 时"只重抽正文,不重归档"。
+    const sourcePath = candidate.source_path || "";
+    const originalSource =
+      sourcePath && existsSync(sourcePath) && !isInsideDir(sourcePath, arch) ? sourcePath : null;
+    const archiveSource =
+      !originalSource && candidate.md_path && existsSync(candidate.md_path) ? candidate.md_path : null;
+
+    if (!originalSource && !archiveSource) {
       setStatus(db, candidate.id, "failed");
       return { id: candidate.id, name: candidate.name, status: "failed", msg: "源文件缺失" };
     }
-    const ext = extOf(sourceAbs);
-    if (ext === ".docx" || ext === ".pdf" || ext === ".xlsx" || ext === ".xls") {
-      const conv = await convertFile(sourceAbs);
-      mdText = conv.markdown;
-      // 扫描件无文本层 -> 标待人工,不判失败
-      if (conv.meta.scanned) {
-        setStatus(db, candidate.id, "archived");
-        return { id: candidate.id, name: candidate.name, status: "archived", msg: "扫描件无文本层,待人工/OCR" };
+
+    let mdText = "";
+    let rearchived = true;
+    if (originalSource) {
+      const ext = extOf(originalSource);
+      if (ext === ".docx" || ext === ".pdf" || ext === ".xlsx" || ext === ".xls") {
+        const conv = await convertFile(originalSource);
+        mdText = conv.markdown;
+        // 扫描件无文本层 -> 标待人工,不判失败
+        if (conv.meta.scanned) {
+          setStatus(db, candidate.id, "archived");
+          return { id: candidate.id, name: candidate.name, status: "archived", msg: "扫描件无文本层,待人工/OCR" };
+        }
+      } else if (ext === ".md" || ext === ".txt") {
+        mdText = readFileSync(originalSource, "utf8");
+        // 原始文件本身就是我们导出的归档 MD(比如被当成新简历再导入一次)→ 先剥壳,杜绝嵌套
+        if (looksLikeArchiveMd(mdText)) mdText = extractResumeBody(mdText);
+      } else {
+        setStatus(db, candidate.id, "failed");
+        return { id: candidate.id, name: candidate.name, status: "failed", msg: `不支持的格式 ${ext}` };
       }
-    } else if (ext === ".md" || ext === ".txt") {
-      mdText = readFileSync(sourceAbs, "utf8");
     } else {
-      setStatus(db, candidate.id, "failed");
-      return { id: candidate.id, name: candidate.name, status: "failed", msg: `不支持的格式 ${ext}` };
+      // 只有归档 MD:正文取最内层,并且**不写新文件**,md_path 保持不变(断掉自我嵌套的循环)
+      mdText = extractResumeBody(readFileSync(archiveSource, "utf8"));
+      rearchived = false;
     }
 
     // 规则抽取
@@ -387,14 +486,22 @@ async function processOne(ctx, db, cfg, candidate, tagIds, forceLlm, route) {
       }
     }
 
-    // 写归档 MD(frontmatter + 正文)
-    const archived = writeResumeMd(cfg, candidate, mdText, finalRes);
+    // 写归档 MD(frontmatter + 正文);只有"真原始文件"这条路径才归档
+    const archived = rearchived ? writeResumeMd(cfg, candidate, mdText, finalRes) : candidate.md_path;
     // 回填归档 MD 路径(真相源仍在 source_path),并按"extracted→archived"顺序落状态
-    updateCandidateProfile(db, candidate.id, finalRes.profile, (() => { try { return statSync(sourceAbs).mtime.toISOString(); } catch { return null; } })());
+    updateCandidateProfile(db, candidate.id, finalRes.profile, (() => {
+      try { return statSync(originalSource || archiveSource).mtime.toISOString(); } catch { return null; }
+    })());
     setCandidateTags(db, candidate.id, tagIds, finalRes.tags);
     db.prepare("UPDATE candidates SET md_path=?, status='archived', updated_at=datetime('now') WHERE id=?").run(archived, candidate.id);
 
-    return { id: candidate.id, name: candidate.name, status: "archived", score: finalRes.maxConf?.toFixed?.(2) ?? "-", msg: archived };
+    return {
+      id: candidate.id,
+      name: candidate.name,
+      status: "archived",
+      score: finalRes.maxConf?.toFixed?.(2) ?? "-",
+      msg: rearchived ? archived : `${archived} (仅重抽正文,未重复归档)`,
+    };
   } catch (e) {
     setStatus(db, candidate.id, "failed");
     return { id: candidate.id, name: candidate.name, status: "failed", msg: e.message || String(e) };
@@ -417,7 +524,7 @@ function renderProcessReport(results) {
 async function ingestFolderAndProcess(ctx, db, cfg, tagIds, folderPath) {
   const out = { scanned: 0, added: 0, dup: 0, processed: 0, results: [] };
   if (!folderPath || !existsSync(folderPath)) return out;
-  const files = collectResumeFiles(folderPath);
+  const files = collectResumeFiles(folderPath, [archiveDir(cfg)]);
   out.scanned = files.length;
   for (const f of files) {
     const hash = await contentHash(f);
@@ -443,10 +550,13 @@ function writeResumeMd(cfg, candidate, mdText, res) {
   const safeName = (candidate.name || "candidate").replace(/[\\/:*?"<>|]/g, "_");
   // 统一归档为 .md,用 candidate.id 保证不同来源同名的原始文件不覆盖
   const mdPath = join(dir, `${safeName}-${candidate.id}.md`);
+  // 防御性剥壳:万一上游还是把归档 MD 当正文传进来,这里也只取最内层真实简历,
+  // 保证归档 MD 永远不会互相嵌套(嵌套会让抽取读到上一层 frontmatter 的残留)。
+  const body = looksLikeArchiveMd(mdText) ? extractResumeBody(mdText) : String(mdText ?? "");
   const fm = frontmatter({ id: candidate.id, name: candidate.name, raw_hash: candidate.raw_hash, ...(res.profile || {}) });
   const tagsBody = (res.tags || []).map((t) => `${t.tagKey}: ${t.value}`).join("\n");
-  const body = `# 候选人 ${candidate.name || ""}\n\n## 标签\n${tagsBody || "(无)"}\n\n## 简历原文\n\n${mdText || ""}\n`;
-  writeFileSync(mdPath, fm + body, "utf8");
+  const content = `# 候选人 ${candidate.name || ""}\n\n## 标签\n${tagsBody || "(无)"}\n\n## 简历原文\n\n${body}\n`;
+  writeFileSync(mdPath, fm + content, "utf8");
   return mdPath;
 }
 
@@ -459,16 +569,39 @@ function frontmatter(f) {
   return `---\n${Object.entries(fm).map(([k, v]) => `${k}: ${v ?? ""}`).join("\n")}\n---\n`;
 }
 
+/** 归档 MD 文件名尾部的历史 id(如 `张三-21.md` → 21),用于"更新的文件优先" */
+function archiveFileSeq(filePath) {
+  const m = String(basename(filePath)).match(/-(\d+)\.md$/i);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * 同一 raw_hash 有多份归档副本时,新解析的这份是否比现有的更好。
+ * 顺序:标签更全 > 非嵌套 > 文件序号更大(更新)。
+ */
+function isBetterArchiveCopy(newParsed, newFile, curParsed, curFile) {
+  const a = (curParsed.tags || []).length;
+  const b = (newParsed.tags || []).length;
+  if (a !== b) return b > a;
+  if (Boolean(curParsed.nested) !== Boolean(newParsed.nested)) return curParsed.nested && !newParsed.nested;
+  return archiveFileSeq(newFile) > archiveFileSeq(curFile);
+}
+
 function parseResumeMd(filePath) {
   let text;
   try { text = readFileSync(filePath, "utf8"); } catch { return null; }
-  const m = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!m) return null;
-  const meta = {};
-  for (const line of m[1].split(/\r?\n/)) {
-    const i = line.indexOf(":");
-    if (i <= 0) continue;
-    meta[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  const split = splitArchiveMd(text);
+  let meta = split?.meta || null;
+  if (!meta) {
+    // 兼容没有 "## 简历原文" 标记的老归档:退化为只读文件头 frontmatter
+    const m = text.match(/^\s*-{3,}\s*\n([\s\S]*?)\n\s*-{3,}\s*(?:\n|$)/);
+    if (!m) return null;
+    meta = {};
+    for (const line of m[1].split(/\r?\n/)) {
+      const i = line.indexOf(":");
+      if (i <= 0) continue;
+      meta[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
   }
   const profile = {
     education: meta["学历"] || undefined,
@@ -489,46 +622,28 @@ function parseResumeMd(filePath) {
     "专业": "major",
   };
   const tags = [];
-  for (const [cnKey, tagKey] of Object.entries(FM_TAG_MAP)) {
-    if (meta[cnKey]) tags.push({ tagKey, value: meta[cnKey], confidence: 1, source: "manual" });
+  // 先恢复「## 标签」段 —— multi 标签(skill / skill_category / experience_direction 等)
+  // 只存在这里,不恢复的话 rebuild 之后技能筛选会全库失效(重建=恢复,不能只恢复一半)。
+  for (const { key, value } of split?.tags || []) {
+    tags.push({ tagKey: key, value, confidence: 1, source: "manual" });
   }
-  return { meta, profile, tags };
+  for (const [cnKey, tagKey] of Object.entries(FM_TAG_MAP)) {
+    if (!meta[cnKey]) continue;
+    if (tags.some((t) => t.tagKey === tagKey && t.value === meta[cnKey])) continue;
+    tags.push({ tagKey, value: meta[cnKey], confidence: 1, source: "manual" });
+  }
+  return { meta, profile, tags, nested: isNestedArchiveMd(text) };
 }
 
 // ============ 辅助 ============
 
 function currentConfig() {
+  // 0.1.7 的 settings 只「投影」不「通知」:面板写入不会重新 apply 本插件(2026-09-26 探针实测),
+  // 所以每个入口(工具 / 斜杠命令)都必须重读宿主镜像,否则运行期一直用加载那一刻的旧值。
+  syncFromSettings();
   const c = liveConfig || resolveConfig();
   // 强制注入粗分类维度:防止持久化设置里的旧 tags 数组遮蔽新增标签。
   return c ? { ...c, tags: withCoarseTags(c.tags) } : c;
-}
-
-function toFlat(config) {
-  return {
-    enabled: config.enabled,
-    libraryRoot: config.libraryRoot,
-    archiveFolder: config.archiveFolder,
-    keepOriginal: config.keepOriginal,
-    dbFile: config.dbFile,
-    tags: config.tags ?? [],
-    llmConfidenceThreshold: config.llmConfidenceThreshold,
-    llmFallback: config.llmFallback,
-    batchSize: config.batchSize,
-  };
-}
-
-function fromFlat(flat) {
-  return {
-    enabled: flat.enabled,
-    libraryRoot: flat.libraryRoot,
-    archiveFolder: flat.archiveFolder,
-    keepOriginal: flat.keepOriginal,
-    dbFile: flat.dbFile,
-    tags: flat.tags ?? [],
-    llmConfidenceThreshold: flat.llmConfidenceThreshold,
-    llmFallback: flat.llmFallback,
-    batchSize: flat.batchSize,
-  };
 }
 
 function textTool(definition) {
@@ -565,7 +680,9 @@ async function callLlm(ctx, route, prompt) {
     id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
     role: "user",
     content: [{ type: "text", text: prompt }],
-    source: { kind: "plugin", plugin: "dsh-resume-screening" },
+    // 这条消息只喂给 ctx.llm.stream({messages}),不写进会话记录 —— v4 的 source kind 门禁本不管它。
+    // 仍统一用 v4 的 producer-owned 形态(plugin:<name>),免得日后把它改成注入会话时踩坑。
+    source: { kind: "plugin:dsh-resume-screening", form: "instructions" },
   };
   const options = { provider, model, messages: [msg], maxTokens: 8000, reasoningEffort: "off" };
   // 超时保护:防止模型/网络挂起导致工具永久卡死(默认 120s)。
@@ -621,6 +738,7 @@ async function llmExtractProfile(ctx, mdText, tags, ruleRes, route) {
     const prompt = `你是简历解析助手。从下面这份简历文本里抽取候选人的结构化档案和语义标签。
 已配置标签:${tagDesc}。
 【强约束】只输出一个 JSON,不要别的文字;不确定的字段填 null,不许编造(比如简历没写性别就填 null)。
+【口径】experience_years = 工作年限(年),**不是年龄**,两者绝不能混(22 岁不可能有 22 年经验);简历写"应届/在校/无经验"时填 0。
 JSON 结构:
 {
   "age": 数字或null, "gender": "男|女|null", "experience_years": 数字或null,
@@ -642,9 +760,19 @@ ${(mdText || "").slice(0, 6000)}
 /** 语义软标签以 LLM 为准:LLM 兜底给了这些 key 时,覆盖规则版,避免规则关键词噪点(设计/工程/客户)残留。 */
 const LLM_AUTHORITATIVE_KEYS = new Set(["skill_category", "experience_direction", "project_management"]);
 
-/** 合并规则 + LLM 结果(规则给硬字段,LLM 给语义软标签并覆盖规则版;tags 去重) */
+/** 硬字段:规则抽取优先,LLM 只补缺(见 mergeExtract) */
+const HARD_PROFILE_KEYS = ["age", "gender", "experience_years", "education", "school", "major"];
+
+/** 合并规则 + LLM 结果(硬字段以规则为准,LLM 补缺;语义软标签以 LLM 为准;tags 去重) */
 function mergeExtract(ruleRes, llmRes) {
-  const profile = { ...(ruleRes.profile || {}), ...(llmRes.profile || {}) };
+  // 硬字段:**规则优先**。规则是确定性、可复现的;LLM 只补规则没抽到的空位。
+  // 旧实现是 {...rule, ...llm},让 LLM 覆盖了硬字段 —— 实测 LLM 会把「年龄 22」填进
+  // experience_years,产出"22 岁 22 年经验"这种明显不可能的数据。
+  const profile = { ...(llmRes.profile || {}) };
+  for (const k of HARD_PROFILE_KEYS) {
+    const rv = ruleRes?.profile?.[k];
+    if (rv !== undefined && rv !== null && rv !== "") profile[k] = rv;
+  }
   const llmKeys = new Set((llmRes?.tags || []).map((t) => t.tagKey).filter((k) => LLM_AUTHORITATIVE_KEYS.has(k)));
   const seen = new Map();
   const tags = [];
@@ -709,7 +837,7 @@ function renderScreenReport(reqId, result, rows) {
         return `${hits.join(" ")}${unc ? ` [${unc}项未定]` : ""}`;
       } catch { return ""; }
     })();
-    lines.push(`${String(r.score).padStart(5)} 分  ${r.name || "?"}  ${r.education || ""} ${r.age ? r.age + "岁" : ""} ${r.experience_years ? r.experience_years + "年" : ""}  ${matched}  [入库:${fmtDate(r.ingested_at)}]`);
+    lines.push(`${String(r.score).padStart(5)} 分  ${r.name || "?"}  ${r.education || ""} ${numText(r.age, "岁")} ${numText(r.experience_years, "年")}  ${matched}  [入库:${fmtDate(r.ingested_at)}]`);
   }
   return lines.join("\n");
 }
@@ -718,6 +846,14 @@ function renderScreenReport(reqId, result, rows) {
 function fmtDate(v) {
   const s = String(v || "");
   return s.length ? s.replace("T", " ").slice(0, 16) : "-";
+}
+
+/**
+ * 数值字段的展示文本。0 是**有效值**(应届生 = 0 年经验),不能被当成"没写"而显示成空白:
+ * 空白会让 HR 分不清"应届 0 年"和"没抽到年限"。
+ */
+function numText(v, unit) {
+  return v === null || v === undefined || v === "" ? "" : `${v}${unit}`;
 }
 
 /** 对入围候选逐份跑 LLM 精判:读原文 → 判适配 → 归一化 → 落库。返回按 LLM 分降序的 judged 列表。 */
@@ -732,12 +868,14 @@ async function judgeCandidates(ctx, db, req, items, targets, route) {
       judged.push({ candidateId: cand.id, name: cand.name || "?", ok: false, error: "无可读原文" });
       continue;
     }
+    const ageText = numText(cand.age, "岁");
+    const yearsText = numText(cand.experience_years, "年");
     const candProfile = [
       `姓名:${cand.name}`,
-      cand.age ? `年龄:${cand.age}岁` : "",
+      ageText ? `年龄:${ageText}` : "",
       cand.gender ? `性别:${cand.gender}` : "",
       cand.education ? `学历:${cand.education}` : "",
-      cand.experience_years ? `经验:${cand.experience_years}年` : "",
+      yearsText ? `经验:${yearsText}` : "",
     ].filter(Boolean).join(" | ");
     const prompt = buildJudgePrompt({ jobDesc, candProfile, candText: body });
     try {
@@ -780,21 +918,38 @@ function renderLlmScreenReport(reqId, judged) {
 }
 
 /** 收集简历文件(递归,跳过隐藏) */
-function collectResumeFiles(root) {
+function collectResumeFiles(root, excludeDirs = []) {
   const exts = new Set([".docx", ".pdf", ".xlsx", ".xls", ".md", ".txt"]);
+  const excludes = excludeDirs.filter(Boolean).map((d) => resolve(d));
   const out = [];
   const stack = [root];
   while (stack.length) {
     const dir = stack.pop();
+    // 跳过归档目录本身及其子目录:归档 MD 是**产物**,不是待入库的简历。
+    // 不排除的话,对着简历库根目录跑一次 ingest 就会把自己的产物再吃一遍(嵌套归档的来源)。
+    if (excludes.some((ex) => isInsideDir(dir, ex))) continue;
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isDirectory()) { stack.push(full); continue; }
-      if (exts.has(extOf(e.name))) out.push(full);
+      const ext = extOf(e.name);
+      if (!exts.has(ext)) continue;
+      // 内容级兜底:别处复制来的归档 MD 也不当简历收(它只有"## 简历原文"段,没有 frontmatter 之外的原始信息)
+      if ((ext === ".md" || ext === ".txt") && isArchiveArtifactFile(full)) continue;
+      out.push(full);
     }
   }
   return out;
+}
+
+/** 文件内容是否是本插件导出的归档 MD */
+function isArchiveArtifactFile(filePath) {
+  try {
+    return looksLikeArchiveMd(readFileSync(filePath, "utf8"));
+  } catch {
+    return false;
+  }
 }
 
 function collectMd(root) {

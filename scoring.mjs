@@ -12,6 +12,7 @@
  *       MUST 项 → 不硬判为"不满足",标记 needDecision(交 HR)
  *       NICE 项 → 按 0 分计(不冤加分,也不冤枉)
  *   - operator: = | != | >= | <= | > | < | in | contains
+ *       contains = 大小写不敏感 + 拉丁整词边界(见 containsLoose):`java` 命中 `Java`、不命中 `JavaScript`
  */
 
 /** 单个候选人对一个条件的匹配结果 */
@@ -40,12 +41,8 @@ function compare(candidate, op, target) {
       const arr = Array.isArray(t) ? t : String(t).split(/[,，]/).map((s) => s.trim());
       return arr.some((x) => normEq(c, x));
     }
-    case "contains": {
-      const cs = String(c ?? "");
-      const ts = String(t ?? "");
-      if (Array.isArray(c)) return c.some((x) => String(x).includes(ts) || ts.includes(String(x)));
-      return cs.includes(ts);
-    }
+    case "contains":
+      return containsLoose(c, t);
     case ">=":
     case "<=":
     case ">":
@@ -60,6 +57,40 @@ function compare(candidate, op, target) {
     }
     default:
       return normEq(c, t);
+  }
+}
+
+/**
+ * contains 匹配:大小写不敏感 + 拉丁词整词边界。
+ *  - 命中:`java` ↔ `Java` / `Java 开发` / 多值数组里任一项(修掉「大小写不同就漏判」)
+ *  - 不命中:`java` ✗ `JavaScript`(右侧紧接字母)—— 修掉「前端被当成 Java 后端」的误伤
+ *  - 含非字母数字的 needle(`c++` / `.net` / `node.js` / 中文词)退化为纯子串匹配,
+ *    否则 `VC++` 会被整词边界判丢、`数据分析` 也永远匹配不上。
+ * 注意:整词边界意味着 `sql` 不再命中 `MySQL`;要匹配这类写法请把关键词写全(如 `mysql`)。
+ */
+export function containsLoose(candidate, target) {
+  const needle = String(target ?? "").trim().toLowerCase();
+  if (!needle) return false;
+  const values = Array.isArray(candidate) ? candidate : [candidate];
+  return values.some((v) => oneContains(String(v ?? "").toLowerCase(), needle));
+}
+
+const ASCII_ALNUM = /[a-z0-9]/;
+const PURE_ASCII_WORD = /^[a-z0-9]+$/;
+
+function oneContains(hay, needle) {
+  if (!hay || !needle) return false;
+  if (!PURE_ASCII_WORD.test(needle)) return hay.includes(needle); // 含 + . - / 或中文 → 纯子串
+  let from = 0;
+  for (;;) {
+    const at = hay.indexOf(needle, from);
+    if (at < 0) return false;
+    const before = at > 0 ? hay[at - 1] : "";
+    const after = hay[at + needle.length] ?? "";
+    const okLeft = !before || !ASCII_ALNUM.test(before);
+    const okRight = !after || !ASCII_ALNUM.test(after);
+    if (okLeft && okRight) return true;
+    from = at + 1;
   }
 }
 

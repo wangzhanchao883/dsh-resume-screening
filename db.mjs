@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { extractResumeBody } from "./md.mjs";
 
 /**
  * SQLite 存储层(物化索引)。
@@ -298,14 +299,12 @@ export function getScreeningLlm(db, reqId) {
   `).all(reqId);
 }
 
-/** 取候选人的归档正文(精判读原文用) */
+/** 取候选人的归档正文(精判读原文用)。嵌套归档时取最内层的真实简历正文。 */
 export function getCandidateBody(db, candidateId) {
   const row = db.prepare("SELECT md_path FROM candidates WHERE id=?").get(candidateId);
   if (!row || !row.md_path) return "";
   try {
-    const txt = readFileSync(row.md_path, "utf8");
-    const i = txt.indexOf("## 简历原文");
-    return i >= 0 ? txt.slice(i + "## 简历原文".length).trim() : txt;
+    return extractResumeBody(readFileSync(row.md_path, "utf8"));
   } catch {
     return "";
   }

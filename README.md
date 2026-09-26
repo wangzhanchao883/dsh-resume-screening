@@ -63,6 +63,18 @@ resume_screen reqId=2 folderPath="D:\简历库\0908简历" llm=true
 resume_export reqId=2 outPath="D:\简历库\结果.csv"
 ```
 
+## 筛选运算符口径
+
+| 运算符 | 口径 |
+|---|---|
+| `=` / `!=` | 去空白 + **大小写不敏感**比较；数值等价（`"5"` == `5`） |
+| `in` | 逗号分隔（中英文逗号都认）任一相等 |
+| `>=` `<=` `>` `<` | 数值比较；值不是数字时退化为相等比较 |
+| `contains` | **大小写不敏感 + 拉丁词整词边界**：`java` 命中 `Java`、`Java 开发`，**不命中** `JavaScript`；`c++` / `.net` / `node.js` / 中文词按子串匹配 |
+
+`contains` 的整词边界意味着 `sql` 不再命中 `MySQL` —— 要匹配这种写法请把关键词写全（如 `mysql`）。
+多值标签（`skill` 等）只要**任意一个值**命中即算命中。
+
 ## 工具一览
 
 | 工具 | 作用 |
@@ -102,14 +114,46 @@ resume_export reqId=2 outPath="D:\简历库\结果.csv"
 2. **标签库**：增改标签定义
 3. **岗位要求**：一岗位一组条件（标签 + 算子 + 阈值 + 必选/可选 + 权重 + 说明文案）
 
+## 环境要求
+
+- **DSH 0.1.7 或更高** —— 设置面板依赖 0.1.7 的 `configForms` 契约。旧版 DSH 上 host 功能（入库 / 建档 / 筛选 / 导出）照常可用，只是**设置面板不会出现**。
+- Node.js `^22` 或 `>=24`（用到内置 `node:sqlite`）
+
 ## 配置
 
-持久化于 `~/.dsh-resume-screening/config.json`，默认简历库 `D:\简历库\`。Web 设置面板在默认值之上叠加用户设置（settings.yaml）。
+三层来源，后者覆盖前者：
+
+1. **内置默认值** —— `config.mjs` 的 `DEFAULT_CONFIG`
+2. **`~/.dsh-resume-screening/config.json`** —— 本地配置文件，仍被读取
+3. **DSH profile 配置** —— `cordis.patch.yml` 里本条目 `insert[].config`，**优先级最高**；Web 设置面板的写入落在这里
+
+> **0.1.7 契约变更**：旧的 `settings.register(...)` + `settings.yaml` 通道已作废（DSH 0.1.7 移除了 `dsh-settings-file`）。
+> 现在插件**具名导出 `Config`**（schemastery schema）供 DSH 投影成设置表单，每个可写字段标 `.volatile()` 表示「能现场改」。
+> 依赖 schemastery `>= 3.18.4`（才有 `.volatile()`），并直接依赖 `@deepseek-ai/cosmokit`（判定/解包 Volatile 盒）。
+>
+> ⚠️ **两个必须知道的 0.1.7 事实**（都是 2026-09-26 实测，0.1.1 在这两条上都栽过）：
+> 1. **`.volatile()` 字段的解析值是「Volatile 盒」不是纯值** —— `apply(ctx, config)` 与 `settings.describe()`
+>    给出的 `config.libraryRoot` 等是 `{get()}` 冻结对象，**必须 `.get()` 解包**，
+>    否则 `path.join()` 会抛 `The "path" argument must be of type string ... Received an instance of Object`
+>    （症状：面板正常，但所有工具一调就崩）。宿主自己的插件也这么解（如 `dsh-agent-default-model`）。
+> 2. **写入设置不会让插件重新 `apply`** —— 面板保存只落盘 + 更新宿主镜像，插件内存里的配置快照不会自动刷新。
+>    所以插件必须在**每个入口**重读 `settings.describe()`；本插件统一收口在 `currentConfig()`。
+
+## 开发与测试
+
+```bash
+npm run check   # 8 个文件语法校验
+npm test        # 回归测试：复刻宿主的「Volatile 盒」配置,真调 resume_init / resume_status,
+                # 并验证「改设置后不重启即生效」
+```
+
+`test/runtime.mock.mjs` 不连宿主、不联网：用插件自己的 `Config` 解析出宿主会交付的那份配置，
+再真调工具。**改了配置读取链路后必跑** —— 这类 bug 只验设置面板是发现不了的。
 
 ## 依赖
 
 - `@deepseek-ai/dsh-tools`（peer，宿主提供）
-- `@deepseek-ai/schemastery`、`mammoth`（docx）、`pdfjs-dist`（pdf）、`xlsx`（excel）
+- `@deepseek-ai/schemastery`、`@deepseek-ai/cosmokit`、`mammoth`（docx）、`pdfjs-dist`（pdf）、`xlsx`（excel）
 - 存储：`node:sqlite`（Node 22+，零外部原生依赖）
 - LLM：复用宿主 `dsh-llm`（`ctx.llm.stream` 标准流式接口，非自建通道）
 

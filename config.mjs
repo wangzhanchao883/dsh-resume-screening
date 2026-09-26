@@ -87,38 +87,6 @@ export function saveConfig(config) {
   writeFileSync(configPath(), JSON.stringify(config, null, 2), "utf8");
 }
 
-/** 插件嵌套结构 → 扁平 settings 结构(client set() 只支持单段路径) */
-export function toFlat(config) {
-  return {
-    enabled: config.enabled,
-    libraryRoot: config.libraryRoot,
-    archiveFolder: config.archiveFolder,
-    keepOriginal: config.keepOriginal,
-    dbFile: config.dbFile,
-    tags: config.tags ?? [],
-    llmConfidenceThreshold: config.llmConfidenceThreshold,
-    llmFallback: config.llmFallback,
-    batchSize: config.batchSize,
-    llmTopN: config.llmTopN,
-  };
-}
-
-/** 扁平 settings 结构 → 插件嵌套结构 */
-export function fromFlat(flat) {
-  return {
-    enabled: flat.enabled,
-    libraryRoot: flat.libraryRoot,
-    archiveFolder: flat.archiveFolder,
-    keepOriginal: flat.keepOriginal,
-    dbFile: flat.dbFile,
-    tags: flat.tags ?? [],
-    llmConfidenceThreshold: flat.llmConfidenceThreshold,
-    llmFallback: flat.llmFallback,
-    batchSize: flat.batchSize,
-    llmTopN: flat.llmTopN,
-  };
-}
-
 function mergeDeep(base, patch) {
   if (patch === undefined || patch === null) return base;
   if (typeof patch !== "object" || Array.isArray(patch)) return patch;

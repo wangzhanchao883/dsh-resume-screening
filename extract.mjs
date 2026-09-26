@@ -8,6 +8,7 @@
  * LLM 兜底由 host 侧通过 ctx.llm 触发(见 index.mjs 的 extractWithLlm),本文件只提供纯函数。
  */
 import { extOf } from "./convert.mjs";
+import { stripFrontmatterBlocks } from "./md.mjs";
 
 const ALIAS = {
   education: {
@@ -21,7 +22,10 @@ const ALIAS = {
 
 /** 从归档 MD 正文(txt)做规则抽取 */
 export function ruleExtract(mdText, tags) {
-  const text = String(mdText || "").replace(/\r/g, "");
+  // 先剥掉可能残留的归档 frontmatter。
+  // 不剥的话,嵌套归档 MD 里上一层的 `专业:` 空值会跨行吃到分隔线 `---`,
+  // 抽出 `major: ---` 这种脏标签(2026-09-26 实测)。
+  const text = stripFrontmatterBlocks(String(mdText || "").replace(/\r/g, ""));
   const profile = {};
   const extracted = [];
   let maxConf = 0;
@@ -41,18 +45,21 @@ export function ruleExtract(mdText, tags) {
     extracted.push({ tagKey: "gender", value: g, confidence: 0.85, source: "rule" });
   }
 
-  // 工作年限:正则"X年(以上/经验)" 或 "X年 X 月"
-  const years = detectYears(text);
-  if (years !== null) {
-    profile.experience_years = years;
-    extracted.push({ tagKey: "experience_years", value: String(years), confidence: 0.8, source: "rule" });
-  }
-
   // 年龄 / 出生年份:先找"年龄 / XX岁",再找"19XX/20XX年出生"
-  const age = detectAge(text);
+  // 先算年龄,是因为工作年限要做"年限 < 年龄 - 最低工作年龄"的合法性校验(见 normalizeYears)。
+  const age = normalizeAge(detectAge(text));
   if (age !== null) {
     profile.age = age;
     extracted.push({ tagKey: "age", value: String(age), confidence: 0.75, source: "rule" });
+  }
+
+  // 工作年限:正则"X年(以上/经验)" 或 "X年 X 月";应届/在校/无经验 → 0;
+  // 非法值(负数 / >60 / 年限 ≥ 年龄-14)一律丢弃,宁缺毋滥 —— 修掉"22 岁 22 年经验"。
+  const rawYears = detectYears(text);
+  const years = normalizeYears(rawYears, age);
+  if (years !== null) {
+    profile.experience_years = years;
+    extracted.push({ tagKey: "experience_years", value: String(years), confidence: rawYears === 0 ? 0.85 : 0.8, source: "rule" });
   }
 
   // 学校:常见院校关键词(示例,规则引擎点到为止;没配到的留给 LLM)
@@ -114,12 +121,18 @@ export function normalizeLlmProfile(raw, promptTags) {
   const tags = [];
   const conf = 0.9;
 
-  mapField(obj, profile, "age", "age", (v) => Number(v));
-  mapField(obj, profile, "gender", "gender");
-  mapField(obj, profile, "experience_years", "experience_years", (v) => Number(v));
-  mapField(obj, profile, "education", "education");
+  mapField(obj, profile, "age", "age", (v) => normalizeAge(v));
+  mapField(obj, profile, "gender", "gender", (v) => normalizeGender(v));
+  mapField(obj, profile, "experience_years", "experience_years", (v) => v);
+  mapField(obj, profile, "education", "education", (v) => normalizeEducation(v));
   mapField(obj, profile, "school", "school");
-  mapField(obj, profile, "major", "major");
+  mapField(obj, profile, "major", "major", (v) => normalizeMajor(v));
+
+  // 年限必须在拿到年龄之后校验:LLM 最常见的一类错就是把"年龄"填进 experience_years
+  // (实测 22 岁应届生被写成 22 年经验)。校验不过就整条丢掉,不留脏值。
+  const safeYears = normalizeYears(profile.experience_years, profile.age);
+  if (safeYears === null) delete profile.experience_years;
+  else profile.experience_years = safeYears;
 
   const knownMap = {};
   for (const k of ["age", "gender", "experience_years", "education", "school", "major"]) {
@@ -154,6 +167,31 @@ function mapField(obj, target, srcKey, dstKey, cast) {
   if (cast) v = cast(v);
   if (v === null || v === undefined || Number.isNaN(v)) return;
   target[dstKey] = v;
+}
+
+/** 性别归一化:模型可能回 male/female/M/F,统一成 男/女;认不出就丢 */
+function normalizeGender(v) {
+  const s = String(v ?? "").trim();
+  if (/^(男|male|m)$/i.test(s)) return "男";
+  if (/^(女|female|f)$/i.test(s)) return "女";
+  return undefined;
+}
+
+/** 学历归一化:模型可能回"研究生/本科在读"等,落到枚举内;认不出就丢 */
+function normalizeEducation(v) {
+  const s = String(v ?? "").trim();
+  for (const k of ["博士", "硕士", "本科", "大专"]) if (s.includes(k)) return k;
+  if (/研究生|master|mba/i.test(s)) return "硕士";
+  if (/学士|bachelor/i.test(s)) return "本科";
+  if (/专科|高职|associate/i.test(s)) return "大专";
+  return undefined;
+}
+
+/** 专业归一化:纯符号/分隔线不算专业(防御 LLM 从嵌套 MD 里抄回 "---") */
+function normalizeMajor(v) {
+  const s = String(v ?? "").trim().replace(/^[-—–]+|[-—–]+$/g, "");
+  if (!s || !/[\u4e00-\u9fa5A-Za-z]/.test(s)) return undefined;
+  return s;
 }
 
 function safeParse(s) {
@@ -193,7 +231,39 @@ function detectGender(text) {
   return null;
 }
 
+/** 应届 / 在校 / 明确无经验:工作年限按 0 计(而不是让兜底正则去抓别的数字,或让 LLM 拿年龄充数) */
+const ENTRY_LEVEL_RE = /应届毕业生|应届生|应届|在校生|无工作经验|暂无工作经验|无经验/;
+/** 工作年限合法上限(年) */
+export const MAX_WORK_YEARS = 60;
+/** 最早可参加工作的年龄:年限必须 < 年龄 - 这个值 */
+const MIN_WORK_AGE = 14;
+
+/** 年龄合法性:14–80 之外的当作噪声丢弃(避免"X岁"误抓成荒谬值) */
+export function normalizeAge(age) {
+  const a = Number(age);
+  if (!Number.isFinite(a) || a < 14 || a > 80) return null;
+  return Math.round(a);
+}
+
+/**
+ * 工作年限合法性校验:非法返回 null(不落库,筛选时按"缺此标签"处理,而不是拿错值硬判)。
+ *  - 非数字 / 负数 / > MAX_WORK_YEARS → null
+ *  - 已知年龄时,年限必须 < 年龄 - MIN_WORK_AGE(22 岁不可能有 22 年经验)→ null
+ */
+export function normalizeYears(years, age) {
+  if (years === null || years === undefined || years === "") return null;
+  const y = Number(years);
+  if (!Number.isFinite(y) || y < 0) return null;
+  if (y > MAX_WORK_YEARS) return null;
+  const a = Number(age);
+  if (Number.isFinite(a) && a > 0 && y > a - MIN_WORK_AGE) return null;
+  return Math.round(y);
+}
+
 function detectYears(text) {
+  // 应届/在校/无经验优先:这类简历里"工作年限：应届毕业生"没有数字,
+  // 老逻辑会掉到兜底正则,再被 LLM 用年龄填成 22。
+  if (ENTRY_LEVEL_RE.test(text)) return 0;
   // 优先命中带"工作/经验/年限"上下文的年限,避免把教育起止年份(如 2022 年)里的"22年"误当工作年限。
   const re = /(?:工作|经验|年限|工龄|从业)[^\n]{0,12}?(\d{1,2})\s*年/i;
   const m = text.match(re);
@@ -237,8 +307,14 @@ const MAJORS = ["计算机科学与技术", "软件工程", "电子信息", "通
 function detectMajor(text) {
   // 优先取"专业"字段(基本信息里的专业,通常对应当前/最高学历专业),
   // 避免按 MAJORS 数组顺序命中本科专业、盖掉硕士专业(与"学历取最高"同类问题)。
-  const field = text.match(/(?:专业|主修)\s*[:：]\s*([^\s|，,；;、\n（(]{2,20})/);
-  if (field) return field[1].trim();
+  // 注意:冒号后只允许同行空白([ \t]),不能是 \s —— 否则"专业:"为空时会跨行
+  // 吃掉下一行的 frontmatter 分隔线,抽出 `---`(2026-09-26 实测)。
+  const field = text.match(/(?:专业|主修)[ \t]*[:：][ \t]*([^\s|，,；;、\n（）()\[\]{}#*]{2,20})/);
+  if (field) {
+    const v = field[1].trim().replace(/^[-—–]+|[-—–]+$/g, "");
+    // 纯符号/纯分隔线不算专业
+    if (v.length >= 2 && /[\u4e00-\u9fa5A-Za-z]/.test(v)) return v;
+  }
   // 兜底:按 MAJORS 顺序首个命中
   for (const m of MAJORS) {
     if (text.includes(m)) return m;
