@@ -1,7 +1,7 @@
 {
   "name": "dsh-resume-screening",
-  "version": "0.1.3",
-  "description": "Resume screening plugin for DeepSeek Harness (HR): ingest up to 100k Word/PDF/Excel resumes into one searchable library with skills / coarse categories / ingest time, auto-ingest & de-dupe new resumes, then screen by plain-language criteria — rule pre-filter in the DB plus LLM fine-judge on the shortlisted few, CSV export. 简历筛选插件:批量收简历建档(技能/粗分类/入库时间),大白话下指令,库内规则粗筛+LLM精判少数入围者,自动入库去重、可导出、可追溯。",
+  "version": "0.1.4",
+  "description": "[支持 DSH 0.1.7–0.2.x / DSH 0.1.7–0.2.x compatible] Resume screening plugin for DeepSeek Harness (HR): ingest up to 100k Word/PDF/Excel resumes into one searchable library with skills / coarse categories / ingest time, auto-ingest & de-dupe new resumes, then screen by plain-language criteria — rule pre-filter in the DB plus LLM fine-judge on the shortlisted few, CSV export. 简历筛选插件:批量收简历建档(技能/粗分类/入库时间),大白话下指令,库内规则粗筛+LLM精判少数入围者,自动入库去重、可导出、可追溯。",
   "type": "module",
   "main": "index.mjs",
   "repository": {
@@ -53,7 +53,7 @@
     "xlsx": "^0.18.5"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0",
     "@deepseek-ai/schemastery": ">=3.18.0 <4.0.0",
     "@deepseek-ai/cosmokit": ">=1.8.5 <2.0.0"
   },
